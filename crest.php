@@ -1,50 +1,64 @@
 <?php
-/**
- * CRest mínimo para Webhook Entrante Bitrix24 (versión persistente)
- *  - Prioriza variable de entorno BITRIX_WEBHOOK (ideal para Render)
- *  - Fallback: lee settings.php si existe
- */
+class CRest {
+    protected static $webhook = null;
 
-class CRest
-{
-    protected static $webhook;
+    protected static function getWebhook() {
+        if (self::$webhook) { return self::$webhook; }
 
-    /**
-     * Devuelve la URL base del webhook configurado
-     */
-    protected static function getWebhook()
-    {
-        // Si ya está en memoria, la devolvemos
-        if (self::$webhook) return self::$webhook;
-
-        // 1️⃣ INTENTA LEER DE VARIABLE DE ENTORNO (persistente en Render)
+        // 1) Variable de entorno (persistente en Render)
         $env = getenv('BITRIX_WEBHOOK');
         if ($env && trim($env) !== '') {
             self::$webhook = rtrim($env, '/') . '/';
             return self::$webhook;
         }
 
-        // 2️⃣ SI NO EXISTE, BUSCA EN settings.php (creado por install.php)
+        // 2) Fallback: settings.php creado por install.php
         $settingsPath = __DIR__ . '/settings.php';
-        if (!file_exists($settingsPath)) {
-            throw new \RuntimeException('Falta settings.php. Abre install.php.');
+        if (file_exists($settingsPath)) {
+            $conf = require $settingsPath;
+            if (is_array($conf) && !empty($conf['webhook'])) {
+                self::$webhook = rtrim($conf['webhook'], '/') . '/';
+                return self::$webhook;
+            }
         }
 
-        $conf = require $settingsPath;
-        if (!is_array($conf) || empty($conf['webhook'])) {
-            throw new \RuntimeException('settings.php inválido. Vuelve a generar desde install.php.');
-        }
-
-        self::$webhook = rtrim($conf['webhook'], '/') . '/';
-        return self::$webhook;
+        throw new RuntimeException('Falta settings.php o variable BITRIX_WEBHOOK.');
     }
 
-    /**
-     * Llama a un método REST de Bitrix24
-     * @param string $method Nombre del método (ej. crm.deal.add)
-     * @param array $params  Parámetros de la llamada
-     * @return array Respuesta JSON decodificada
-     */
-    public static function call(string $method, array $params = [])
-    {
-        $url = self::getWebhook() . l
+    public static function call($method, $params = []) {
+        $url = self::getWebhook() . ltrim($method, '/');
+        $payload = json_encode($params, JSON_UNESCAPED_UNICODE);
+
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_POST => true,
+            CURLOPT_HTTPHEADER => [
+                'Content-Type: application/json',
+                'Accept: application/json'
+            ],
+            CURLOPT_POSTFIELDS => $payload,
+            CURLOPT_CONNECTTIMEOUT => 10,
+            CURLOPT_TIMEOUT => 30,
+        ]);
+        $raw  = curl_exec($ch);
+        $errno= curl_errno($ch);
+        $http = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+
+        if ($errno) {
+            return ['error'=>'curl_error','error_description'=>'Fallo de red: '.$errno,'http_code'=>$http];
+        }
+        if ($raw === false) {
+            return ['error'=>'empty_response','error_description'=>'Respuesta vacía','http_code'=>$http];
+        }
+
+        $json = json_decode($raw, true);
+        if ($json === null) {
+            return ['error'=>'invalid_json','error_description'=>'JSON no válido: '.$raw,'http_code'=>$http];
+        }
+        if (!isset($json['http_code'])) { $json['http_code'] = $http; }
+        return $json;
+    }
+}
+
